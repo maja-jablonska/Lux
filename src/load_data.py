@@ -81,42 +81,44 @@ def load_spectra(path, file_name):
                 print('File does not already exists')
                 print("Loading spectra from directory %s" %path)
                 files = list(sorted([path + "/" + filename for filename in os.listdir(path) if filename.endswith('.fits')]))
-                nstars = len(files)  
+                nstars = len(files)
 
+                # accumulate in mutable numpy buffers and convert to jax arrays once at
+                # the end: jax's functional `.at[...].set(...)` copies the full array on
+                # every update, which makes the per-file loop O(nstars^2 * npixels)
                 for file, fits_file in tqdm.tqdm(enumerate(files)):
                         file_in = fits.open(fits_file)
-                        flux_ = jnp.array(file_in[1].data) 
-                        flux_err_ = jnp.array((file_in[2].data))
+                        flux_ = np.asarray(file_in[1].data, dtype=float)
+                        flux_err_ = np.asarray(file_in[2].data, dtype=float)
 
                         if file == 0:
                                 npixels = len(flux_)
-                                fluxes = jnp.zeros((nstars, npixels), dtype=float)
-                                fluxes_err = jnp.zeros(fluxes.shape, dtype=float)
-                                ivars = jnp.zeros(fluxes.shape, dtype=float)
+                                fluxes = np.zeros((nstars, npixels), dtype=float)
+                                fluxes_err = np.zeros(fluxes.shape, dtype=float)
+                                ivars = np.zeros(fluxes.shape, dtype=float)
                                 start_wl = file_in[1].header['CRVAL1']
                                 diff_wl = file_in[1].header['CDELT1']
                                 val = diff_wl * (npixels) + start_wl
-                                wl_full_log = jnp.arange(start_wl,val, diff_wl)
-                                wl_full = [10 ** aval for aval in wl_full_log]
-                                wl = jnp.array(wl_full)
+                                wl_full_log = np.arange(start_wl, val, diff_wl)
+                                wl = 10 ** wl_full_log
 
-                        fluxes = fluxes.at[file,:].set(flux_)
-                        fluxes_err = fluxes_err.at[file,:].set(flux_err_)
-                        ivar = 1. /flux_err_**2
-                        ivars = ivars.at[file,:].set(ivar)
+                        fluxes[file, :] = flux_
+                        fluxes_err[file, :] = flux_err_
+                        ivar = 1. / flux_err_**2
+                        ivars[file, :] = ivar
 
                         # do some quality controls
                         # where the inverse variances are low
-                        pixmask = (ivar<0.01)
-                        fluxes = fluxes.at[file,pixmask].set(1)
-                        fluxes_err = fluxes_err.at[file,pixmask].set(9999)
-                        ivars = ivars.at[file,pixmask].set(0.01)
+                        pixmask = (ivar < 0.01)
+                        fluxes[file, pixmask] = 1
+                        fluxes_err[file, pixmask] = 9999
+                        ivars[file, pixmask] = 0.01
 
                         pixmask2 = (flux_ > 0)
-                        fluxes = fluxes.at[file, ~pixmask2].set(1)
-                        fluxes_err = fluxes_err.at[file, ~pixmask2].set(9999)
-                        ivars = ivars.at[file, ~pixmask2].set(0.01)
-                        
+                        fluxes[file, ~pixmask2] = 1
+                        fluxes_err[file, ~pixmask2] = 9999
+                        ivars[file, ~pixmask2] = 0.01
+
 
                 print("Spectra loaded")
                 spectra_data = {'wl': jnp.array(wl), 'fluxes': jnp.array(fluxes),\

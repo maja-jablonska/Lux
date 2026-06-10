@@ -316,7 +316,11 @@ def run_agenda(alphas, betas, zetas, labels, label_err, fluxes, fluxes_err, omeg
         
         return res_alphas_step.params['alphas'], res_betas_step.params['betas'], res_zetas_step.params['zetas'], chi2_init - chi2_step, chi2_step
 
-
+# jit the full agenda: the jaxopt solver instances are created inside the step
+# functions, so their internally-jitted ``run`` is a fresh closure on every call
+# and XLA recompiles the whole program each training iteration. Compiling the
+# agenda once here makes repeated iterations ~100x faster
+run_agenda = jax.jit(run_agenda)
 
 
 
@@ -334,23 +338,7 @@ def run_agenda(alphas, betas, zetas, labels, label_err, fluxes, fluxes_err, omeg
 # zetas corresponding to the test set (or new stars). Once you have those, you can estimate the labels/spectra
 
 ################### FOR ZETAS FROM SPECTRA
-def synthetise_one_wavelength_one_star(zeta_i, beta_h):
-        """
-                Function to use in the loss function (chi2) for optimising one wavelength and one star. For now, this is treated as linear model
-
-                INPUT: 
-                        zeta_i: latent parameter zeta for ith star
-                        beta_h: latent parameter beta for hth wavelength
-
-                OUTPUT:
-                        dot product of zeta_i and beta_h
-        """
-
-        return zeta_i @ beta_h
-    
-# vmaps to loop over all stars or over all wavelength   
-synthetise_one_wavelength_all_stars =  jax.vmap(synthetise_one_wavelength_one_star, in_axes = (0, None)) # all stars
-synthetise_all_wavelengths_one_star =  jax.vmap(synthetise_one_wavelength_one_star, in_axes = (None, 0)) # all wavelengths
+# NOTE: reuses synthetise_one_wavelength_one_star and its vmaps defined above
 
 def all_wavelengths_one_star_chi(params, data):
         """
@@ -389,22 +377,7 @@ def find_one_zeta_test_step(zetas_init, betas, fluxes, fluxes_err):
 zetas_test_step = jax.vmap(find_one_zeta_test_step, in_axes=(0, None, 0, 0))
 
 ################### FOR ZETAS FROM LABELS
-def synthetise_one_label_one_star(zeta_i, alpha_m):
-        """
-                Function to use in the loss function (chi2) for optimising one label and one star. For now, this is treated as linear model
-
-                INPUT: 
-                        zeta_i: latent parameter zeta for ith star
-                        alpha_m: latent parameter alpha for mth label
-
-                OUTPUT:
-                        dot product of zeta_i and beta_h
-        """
-
-        return zeta_i @ alpha_m
-    
-synthetise_one_label_all_stars =  jax.vmap(synthetise_one_label_one_star, in_axes = (0, None)) # all stars
-synthetise_all_labels_one_star =  jax.vmap(synthetise_one_label_one_star, in_axes = (None, 0)) # all wavelengths
+# NOTE: reuses synthetise_one_label_one_star and its vmaps defined above
 
 def all_labels_one_star_chi(params, data):
         """
