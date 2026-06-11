@@ -1,0 +1,37 @@
+#!/bin/bash
+# Sync offline wandb runs to wandb.ai from Gadi's copyq (data-mover nodes
+# have external network access; gpuvolta compute nodes do not).
+#
+# Requires `wandb login` to have been run once on a login node (credentials
+# land in ~/.netrc, which copyq nodes can read).
+#
+# Usually submitted automatically by jobs/sweep-gpu.pbs with an afterany
+# dependency, but can also be run standalone:  qsub jobs/sync-wandb.pbs
+
+#PBS -P mk27
+#PBS -q copyq
+#PBS -l ncpus=1
+#PBS -l mem=4GB
+#PBS -l walltime=01:00:00
+#PBS -l storage=scratch/mk27
+#PBS -l wd
+#PBS -N lux-wandb-sync
+#PBS -j oe
+
+set -eu
+
+LUX=/scratch/mk27/mj8805/Lux
+
+module load python3/3.11.0
+source "$LUX/venv/bin/activate"
+
+shopt -s nullglob
+runs=("$LUX"/wandb/offline-run-*)
+if (( ${#runs[@]} == 0 )); then
+    echo "no offline wandb runs found under $LUX/wandb - nothing to sync"
+    exit 0
+fi
+
+echo "syncing ${#runs[@]} offline run(s)"
+# already-synced runs are skipped, so re-running this job is harmless
+wandb sync "${runs[@]}"

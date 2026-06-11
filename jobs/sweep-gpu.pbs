@@ -2,8 +2,10 @@
 # GPU hyperparameter sweep of the LuxModel on Gadi, logged to wandb offline.
 #
 # Submit with:  qsub jobs/sweep-gpu.pbs
-# Afterwards, sync the offline runs from a login node (which has network):
-#   wandb sync /scratch/mk27/mj8805/Lux/wandb/offline-run-*
+#
+# On startup this job queues jobs/sync-wandb.pbs on copyq with an afterany
+# dependency, so the offline runs are synced to wandb.ai when this job ends
+# (even on failure or walltime kill). Requires a prior `wandb login`.
 #
 # gpuvolta requires ncpus = 12 x ngpus. One V100 is enough: the fit is
 # closed-form block updates, so each grid point is minutes, not hours.
@@ -23,6 +25,11 @@
 set -eu
 
 LUX=/scratch/mk27/mj8805/Lux
+
+# queue the wandb sync on copyq now, gated on this job finishing; afterany
+# (not afterok) so partial sweeps still get their completed runs synced
+SYNC_JOBID=$(qsub -W depend=afterany:"$PBS_JOBID" "$LUX/jobs/sync-wandb.pbs")
+echo "wandb sync job queued on copyq: $SYNC_JOBID (runs after $PBS_JOBID)"
 
 module load python3/3.11.0 cuda/12.3.2
 # venv must have requirements.txt plus a CUDA-enabled jax, e.g.:
