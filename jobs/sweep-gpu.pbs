@@ -1,0 +1,42 @@
+#!/bin/bash
+# GPU hyperparameter sweep of the LuxModel on Gadi, logged to wandb offline.
+#
+# Submit with:  qsub jobs/sweep-gpu.pbs
+# Afterwards, sync the offline runs from a login node (which has network):
+#   wandb sync /scratch/mk27/mj8805/Lux/wandb/offline-run-*
+#
+# gpuvolta requires ncpus = 12 x ngpus. One V100 is enough: the fit is
+# closed-form block updates, so each grid point is minutes, not hours.
+
+#PBS -P mk27
+#PBS -q gpuvolta
+#PBS -l ngpus=1
+#PBS -l ncpus=12
+#PBS -l mem=90GB
+#PBS -l jobfs=10GB
+#PBS -l walltime=06:00:00
+#PBS -l storage=scratch/mk27
+#PBS -l wd
+#PBS -N lux-sweep
+#PBS -j oe
+
+set -eu
+
+LUX=/scratch/mk27/mj8805/Lux
+
+module load python3/3.11.0 cuda/12.3.2
+# venv must have requirements.txt plus a CUDA-enabled jax, e.g.:
+#   pip install -r requirements.txt && pip install -U "jax[cuda12]"
+source "$LUX/venv/bin/activate"
+
+# compute nodes have no internet access, so wandb must stay offline
+export WANDB_MODE=offline
+export WANDB_DIR="$LUX"
+
+cd "$LUX/src"
+python run_sweep.py \
+    --data /home/100/mj8805/scr_mk27/bulge-ages-and-orbits/data/merged_with_ages.parquet \
+    --P 32 64 128 256 \
+    --l2 1000 5000 10000 \
+    --n-iterations 2000 \
+    --outdir "$LUX/sweep-models"
