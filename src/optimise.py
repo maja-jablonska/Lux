@@ -236,6 +236,104 @@ def one_star_zeta_step(zetas_n, alphas, betas, labels, labels_err, fluxes, fluxe
 zeta_step = jax.vmap(one_star_zeta_step, in_axes=(0, None, None, 0, 0, 0, 0))
 
 # #######################################################################
+# DIRECT (CLOSED-FORM) BLOCK SOLVERS
+# The model is linear in each of the alphas, betas, and zetas blocks, so
+# every block update is a weighted linear least-squares problem with an
+# exact solution. The Gauss-Newton solvers above reach the same optimum
+# (Gauss-Newton is exact for linear residuals) but materialise the full
+# Jacobian of every vmapped sub-problem at once -- e.g. Lambda x N x P for
+# the beta step -- which exhausts device memory for survey-sized data.
+# NaNs in the data are given zero weight, matching the nansum semantics
+# of the chi2 functions below.
+# #######################################################################
+
+def _masked(values, weights):
+        """Zero out the weight (and value) of non-finite data entries."""
+        mask = jnp.isfinite(values)
+        return jnp.where(mask, values, 0.), jnp.where(mask, weights, 0.)
+
+def _anchored_solve(G, rhs, params_init):
+        """
+                Solve G x = rhs per batch element with a negligible ridge towards
+                params_init: exact where the data constrain x, and x = params_init
+                along directions of zero curvature (mirroring Gauss-Newton, which
+                leaves such directions at their initial values)
+        """
+        P = G.shape[-1]
+        # the ridge must sit far below the smallest genuine eigenvalue of G,
+        # not just below its trace (which the largest eigenvalue dominates
+        # when G is ill-conditioned, e.g. via the continuum direction)
+        eps = 1e-12 * jnp.trace(G, axis1=-2, axis2=-1)[:, None] / P + 1e-300
+        G = G + eps[..., None] * jnp.eye(P)
+        rhs = rhs + eps * params_init
+        return jnp.linalg.solve(G, rhs[..., None])[..., 0]
+
+def alpha_step_direct(alphas, zetas, labels, labels_err):
+        """
+                Exact alphas at fixed zetas: for each label m, solve the weighted
+                normal equations (Z^T W_m Z) alpha_m = Z^T W_m l_m
+                INPUT:
+                        alphas: latent parameters for the labels (anchor for
+                                unconstrained directions), M x P
+                        zetas: latent parameters for the stars, N x P
+                        labels: array of labels; size N x M
+                        labels_err: array of label errors; size N x M
+                OUTPUT:
+                        optimised alphas, M x P
+        """
+        l, w = _masked(labels, 1. / labels_err**2)
+        zz = zetas[:, :, None] * zetas[:, None, :]              # N x P x P
+        G = jnp.einsum('npq,nm->mpq', zz, w)                    # M x P x P
+        rhs = (w * l).T @ zetas                                 # M x P
+        return _anchored_solve(G, rhs, alphas)
+
+def beta_step_direct(betas, zetas, fluxes, fluxes_err):
+        """
+                Exact betas at fixed zetas: for each wavelength h, solve the
+                weighted normal equations (Z^T W_h Z) beta_h = Z^T W_h f_h
+                INPUT:
+                        betas: latent parameters for the wavelengths (anchor for
+                               unconstrained directions), Lambda x P
+                        zetas: latent parameters for the stars, N x P
+                        fluxes: array of flux values; size N x Lambda
+                        fluxes_err: array of flux errors; size N x Lambda
+                OUTPUT:
+                        optimised betas, Lambda x P
+        """
+        f, w = _masked(fluxes, 1. / fluxes_err**2)
+        zz = zetas[:, :, None] * zetas[:, None, :]              # N x P x P
+        G = jnp.einsum('npq,nh->hpq', zz, w)                    # Lambda x P x P
+        rhs = (w * f).T @ zetas                                 # Lambda x P
+        return _anchored_solve(G, rhs, betas)
+
+def zeta_step_direct(zetas, alphas, betas, labels, labels_err, fluxes, fluxes_err, omega=1.):
+        """
+                Exact zetas at fixed alphas and betas: for each star n the joint
+                label-and-flux objective is quadratic, so solve the weighted normal
+                equations (omega A^T W_l A + B^T W_f B) zeta_n = rhs_n
+                INPUT:
+                        zetas: latent parameters for the stars (anchor for
+                               unconstrained directions), N x P
+                        alphas: latent parameters for the labels, M x P
+                        betas: latent parameters for the wavelengths, Lambda x P
+                        labels: array of labels; size N x M
+                        labels_err: array of label errors; size N x M
+                        fluxes: array of flux values; size N x Lambda
+                        fluxes_err: array of flux errors; size N x Lambda
+                        omega: weight of the label term in the joint likelihood
+                OUTPUT:
+                        optimised zetas, N x P
+        """
+        l, wl = _masked(labels, 1. / labels_err**2)
+        f, wf = _masked(fluxes, 1. / fluxes_err**2)
+        aa = alphas[:, :, None] * alphas[:, None, :]            # M x P x P
+        bb = betas[:, :, None] * betas[:, None, :]              # Lambda x P x P
+        G = omega * jnp.einsum('mpq,nm->npq', aa, wl) \
+            + jnp.einsum('hpq,nh->npq', bb, wf)                 # N x P x P
+        rhs = omega * (wl * l) @ alphas + (wf * f) @ betas      # N x P
+        return _anchored_solve(G, rhs, zetas)
+
+# #######################################################################
 # FUNCTIONS TO RUN THE OPTIMISATION AND CALCULATE CHI2
 # #######################################################################
 
@@ -301,25 +399,23 @@ def run_agenda(alphas, betas, zetas, labels, label_err, fluxes, fluxes_err, omeg
                 optimised alphas, betas, zetas, difference in chi2 between initial and current chi2, and chi2 at each step
         """
 
-        # run the alpha step
-        res_alphas_step = alpha_step(alphas, zetas, labels, label_err)
+        # run the alpha step (exact, at the current zetas)
+        alphas_updated = alpha_step_direct(alphas, zetas, labels, label_err)
 
-        # run the beta step
-        res_betas_step = beta_step(betas, zetas, fluxes, fluxes_err)
+        # run the beta step (exact, at the current zetas)
+        betas_updated = beta_step_direct(betas, zetas, fluxes, fluxes_err)
 
-        # run the zeta step
-        res_zetas_step = zeta_step(zetas, res_alphas_step.params['alphas'], res_betas_step.params['betas'], labels, label_err, fluxes, fluxes_err)
-        
+        # run the zeta step (exact, at the updated alphas and betas; omega
+        # weighs the label term, matching the chi2 reported below)
+        zetas_updated = zeta_step_direct(zetas, alphas_updated, betas_updated, labels, label_err, fluxes, fluxes_err, omega)
+
         #check that this step improved chi2 and throw an error if diff_chi2 is negative
-        chi2_init = all_wavelengths_all_labels_all_stars_chi2(res_alphas_step.params['alphas'], res_betas_step.params['betas'], zetas, labels, label_err, fluxes, fluxes_err, omega)
-        chi2_step = all_wavelengths_all_labels_all_stars_chi2(res_alphas_step.params['alphas'], res_betas_step.params['betas'], res_zetas_step.params['zetas'], labels, label_err, fluxes, fluxes_err, omega)
-        
-        return res_alphas_step.params['alphas'], res_betas_step.params['betas'], res_zetas_step.params['zetas'], chi2_init - chi2_step, chi2_step
+        chi2_init = all_wavelengths_all_labels_all_stars_chi2(alphas_updated, betas_updated, zetas, labels, label_err, fluxes, fluxes_err, omega)
+        chi2_step = all_wavelengths_all_labels_all_stars_chi2(alphas_updated, betas_updated, zetas_updated, labels, label_err, fluxes, fluxes_err, omega)
 
-# jit the full agenda: the jaxopt solver instances are created inside the step
-# functions, so their internally-jitted ``run`` is a fresh closure on every call
-# and XLA recompiles the whole program each training iteration. Compiling the
-# agenda once here makes repeated iterations ~100x faster
+        return alphas_updated, betas_updated, zetas_updated, chi2_init - chi2_step, chi2_step
+
+# jit the full agenda so repeated training iterations reuse the compiled program
 run_agenda = jax.jit(run_agenda)
 
 
