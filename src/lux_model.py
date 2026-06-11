@@ -21,8 +21,6 @@ jax.config.update("jax_enable_x64", True)
 import jax.numpy as jnp
 import dill as pickle
 
-import jaxopt
-
 import init_latents as il
 import optimise as opt
 import scatters as opt_sc
@@ -31,31 +29,24 @@ import scatters as opt_sc
 _NEGLIGIBLE_LN_NOISE = -20.0
 
 
-def _labels_map_objective(params, data):
-    """
-    Negative log-posterior for the test-set zetas given labels only: the
-    Gaussian label likelihood plus an empirical Gaussian prior on the zetas
-    estimated from the training set. The prior pins latent directions the
-    labels cannot constrain (the null space of the alphas), which otherwise
-    drift arbitrarily and corrupt synthesised fluxes.
-    """
-    z = params['zetas']
-    chi2 = jnp.nansum((data['labels'] - z @ data['alphas'].T)**2 * data['labels_ivars'])
-    dz = z - data['zeta_mean']
-    prior = jnp.sum((dz @ data['zeta_prec']) * dz)
-    return 0.5 * (chi2 + prior)
-
-
 @jax.jit
-def _run_labels_map(zetas_init, labels, labels_ivars, alphas, zeta_mean, zeta_prec):
-    # jitted so repeated calls with the same shapes reuse the compiled program
-    optimizer = jaxopt.LBFGS(fun=_labels_map_objective, tol=1e-6,
-                             maxiter=3000, max_stepsize=1e3)
-    res = optimizer.run(
-        init_params={'zetas': zetas_init},
-        data={'labels': labels, 'labels_ivars': labels_ivars,
-              'alphas': alphas, 'zeta_mean': zeta_mean, 'zeta_prec': zeta_prec})
-    return res.params['zetas']
+def _run_labels_map(labels, labels_ivars, alphas, zeta_mean, zeta_prec):
+    """
+    MAP estimate of the test-set zetas given labels only: the Gaussian label
+    likelihood plus an empirical Gaussian prior on the zetas estimated from
+    the training set. The prior pins latent directions the labels cannot
+    constrain (the null space of the alphas), which otherwise drift
+    arbitrarily and corrupt synthesised fluxes. The posterior is Gaussian in
+    the zetas, so the MAP solution solves, per star,
+    (A^T W A + Prec) zeta = A^T W l + Prec mu exactly.
+    """
+    mask = jnp.isfinite(labels)
+    w = jnp.where(mask, labels_ivars, 0.)
+    l = jnp.where(mask, labels, 0.)
+    aa = alphas[:, :, None] * alphas[:, None, :]            # M x P x P
+    G = jnp.einsum('mpq,nm->npq', aa, w) + zeta_prec[None]  # N x P x P
+    rhs = (w * l) @ alphas + zeta_prec @ zeta_mean          # N x P
+    return jnp.linalg.solve(G, rhs[..., None])[..., 0]
 
 
 class NotTrainedError(RuntimeError):
@@ -113,7 +104,7 @@ class LuxModel:
 
     def fit(self, labels, labels_err, fluxes, fluxes_err, n_iterations=5,
             fit_scatters=True, l2_reg_strength=1.0, ln_noise_fluxes_init=-8.0,
-            label_names=None, verbose=True):
+            max_scatter_sweeps=100, label_names=None, verbose=True):
         """
         Train the model latents on a set of stars with known labels and spectra.
 
@@ -130,6 +121,10 @@ class LuxModel:
                                  (only used when fit_scatters is True)
                 ln_noise_fluxes_init: initial value of the logarithmic
                                       per-pixel scatters
+                max_scatter_sweeps: maximum number of exact coordinate-descent
+                                    sweeps of the scatter agenda; sweeps stop
+                                    early once the negative log-likelihood
+                                    stops improving
                 label_names: optional list of M label names, stored for
                              bookkeeping
                 verbose: print chi2 progress
@@ -177,13 +172,26 @@ class LuxModel:
             labels_ivars = 1. / labels_err**2
             fluxes_ivars = 1. / fluxes_err**2
             ln_noise_fluxes = jnp.full(fluxes.shape[1], float(ln_noise_fluxes_init))
-            betas, zetas, ln_noise_fluxes, nll = opt_sc.run_agenda(
-                alphas, betas, zetas, labels, labels_ivars, fluxes, fluxes_ivars,
-                ln_noise_fluxes, float(l2_reg_strength), self.omega)
+            # each sweep exactly minimises the scatters, betas, and zetas blocks
+            # in turn, so the negative log-likelihood decreases monotonically;
+            # the per-sweep gain decays geometrically (the betas-zetas coupling
+            # makes this alternating least squares with linear convergence), so
+            # stop once the relative improvement is negligible
+            nll = np.inf
+            for sweep in range(max_scatter_sweeps):
+                betas, zetas, ln_noise_fluxes, nll_sweep = opt_sc.run_agenda(
+                    alphas, betas, zetas, labels, labels_ivars, fluxes, fluxes_ivars,
+                    ln_noise_fluxes, float(l2_reg_strength), self.omega)
+                nll_sweep = float(nll_sweep)
+                converged = nll - nll_sweep <= 1e-6 * max(1.0, abs(nll_sweep))
+                nll = nll_sweep
+                if converged:
+                    break
             self.ln_noise_fluxes = ln_noise_fluxes
-            self.nll = float(nll)
+            self.nll = nll
             if verbose:
-                print(f"scatter fit: negative log-likelihood = {self.nll:.4f}")
+                print(f"scatter fit: {sweep + 1} sweeps, "
+                      f"negative log-likelihood = {self.nll:.4f}")
 
         self.alphas = alphas
         self.betas = betas
@@ -219,9 +227,8 @@ class LuxModel:
             ln_noise_fluxes = jnp.full(self.n_wavelengths, _NEGLIGIBLE_LN_NOISE)
 
         zetas_init = self._init_test_zetas(fluxes.shape[0])
-        res = opt_sc.get_zetas_test_using_fluxes(
+        return opt_sc.get_zetas_test_using_fluxes_direct(
             fluxes, fluxes_ivars, self.betas, zetas_init, ln_noise_fluxes)
-        return res.params['zetas']
 
     def infer_zetas_from_labels(self, labels, labels_err, use_prior=True):
         """
@@ -254,12 +261,11 @@ class LuxModel:
         zetas_init = self._init_test_zetas(labels.shape[0])
 
         if not use_prior or self.zetas is None:
-            res = opt_sc.get_zetas_test_using_labels(
+            return opt_sc.get_zetas_test_using_labels_direct(
                 labels, labels_ivars, self.alphas, zetas_init)
-            return res.params['zetas']
 
         zeta_mean, zeta_prec = self._zeta_prior()
-        return _run_labels_map(zetas_init, labels, labels_ivars,
+        return _run_labels_map(labels, labels_ivars,
                                self.alphas, zeta_mean, zeta_prec)
 
     # ------------------------------------------------------------------
