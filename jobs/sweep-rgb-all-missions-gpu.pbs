@@ -1,0 +1,52 @@
+#!/bin/bash
+# GPU P/l2 sweep of the LuxModel on the Willett all-missions RGB sample,
+# logged to wandb offline.
+#
+# Submit with:  qsub jobs/sweep-rgb-all-missions-gpu.pbs
+#
+# On startup this job queues jobs/sync-wandb.pbs on copyq with an afterany
+# dependency, so the offline runs are synced to wandb.ai when this job ends
+# (even on failure or walltime kill). Requires a prior `wandb login`.
+#
+# The sweep checkpoints finished (P, l2) points to a results parquet and
+# skips them on re-run, so if walltime kills it, just qsub again -- only the
+# fit in progress is lost.
+#
+# gpuvolta requires ncpus = 12 x ngpus.
+
+#PBS -P mk27
+#PBS -q gpuvolta
+#PBS -l ngpus=1
+#PBS -l ncpus=12
+#PBS -l mem=90GB
+#PBS -l jobfs=10GB
+#PBS -l walltime=12:00:00
+#PBS -l storage=scratch/mk27
+#PBS -l wd
+#PBS -N lux-sweep-rgb
+#PBS -j oe
+
+set -eu
+
+LUX=/scratch/mk27/mj8805/Lux
+
+# queue the wandb sync on copyq now, gated on this job finishing; afterany
+# (not afterok) so partial sweeps still get their completed runs synced
+SYNC_JOBID=$(qsub -W depend=afterany:"$PBS_JOBID" "$LUX/jobs/sync-wandb.pbs")
+echo "wandb sync job queued on copyq: $SYNC_JOBID (runs after $PBS_JOBID)"
+
+module load python3/3.11.0 cuda/12.3.2
+# venv must have requirements.txt plus a CUDA-enabled jax, e.g.:
+#   pip install -r requirements.txt && pip install -U "jax[cuda12]"
+source "$LUX/venv/bin/activate"
+
+# compute nodes have no internet access, so wandb must stay offline
+export WANDB_MODE=offline
+export WANDB_DIR="$LUX"
+
+cd "$LUX/src"
+python run_sweep_rgb_all_missions.py \
+    --P 128 256 384 \
+    --l2 100 300 1000 3000 \
+    --n-iterations 1000 \
+    --results "$LUX/lux-sweep-p-l2-rgb-wilett-all-missions.parquet"
