@@ -1,0 +1,60 @@
+#!/bin/bash
+# Apply the trained Lux all-missions RGB model to the bulge RGB sample --
+# single-GPU inference job (src/predict_bulge_rgb_ages.py).
+#
+# Submit with:  qsub jobs/predict-bulge-rgb-gpu.pbs
+# or override:  qsub -v MODEL=/path/model.dill,SPECTRA=/path/sample.parquet,\
+#                   OUTPUT=/path/lux_ages_rgb.parquet \
+#                   jobs/predict-bulge-rgb-gpu.pbs
+#
+# If the pixel-mask sidecar (<MODEL>.pixel-mask.npz) does not exist yet, the
+# first run replays the training data pipeline to derive it (needs
+# merged_with_ages_raw.parquet + rgb_selection_all_missions.parquet under the
+# data root) and caches it; later runs skip that entirely.
+#
+# gpuvolta requires ncpus = 12 x ngpus.
+
+#PBS -P mk27
+#PBS -q gpuvolta
+#PBS -l ngpus=1
+#PBS -l ncpus=12
+#PBS -l mem=90GB
+#PBS -l jobfs=10GB
+#PBS -l walltime=04:00:00
+#PBS -l storage=scratch/mk27
+#PBS -l wd
+#PBS -N lux-predict-bulge-rgb
+#PBS -j oe
+
+set -eu
+
+LUX=/scratch/mk27/mj8805/Lux
+DATA_DIR=/home/100/mj8805/scr_mk27/bulge-ages-and-orbits/data
+
+MODEL="${MODEL:-$LUX/lux-model-rgb-wilett-all-missions.dill}"
+SPECTRA="${SPECTRA:-$DATA_DIR/bulge_rgb_spectra.parquet}"
+OUTPUT="${OUTPUT:-$DATA_DIR/lux_ages_rgb.parquet}"
+CHUNK="${CHUNK:-2048}"
+
+if [ ! -f "$MODEL" ]; then
+    echo "[$(date)] ERROR: no model at $MODEL; pass MODEL=/path/to/model.dill"
+    exit 1
+fi
+if [ ! -f "$SPECTRA" ]; then
+    echo "[$(date)] ERROR: no spectra at $SPECTRA"
+    exit 1
+fi
+
+module load python3/3.11.0 cuda/12.3.2
+# venv must have requirements.txt plus a CUDA-enabled jax, e.g.:
+#   pip install -r requirements.txt && pip install -U "jax[cuda12]"
+source "$LUX/venv/bin/activate"
+
+cd "$LUX/src"
+echo "[$(date)] Lux inference: $MODEL on $SPECTRA ($(hostname))"
+python predict_bulge_rgb_ages.py \
+    --model "$MODEL" \
+    --spectra "$SPECTRA" \
+    --output "$OUTPUT" \
+    --chunk "$CHUNK"
+echo "[$(date)] done; wrote $OUTPUT"

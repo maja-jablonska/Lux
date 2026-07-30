@@ -37,8 +37,12 @@ import pandas as pd
 import wandb
 
 # thecannon is used only for its continuum module, so the normalization is
-# identical to the AnniesLasso notebook that defines this dataset
-for cand in ['../../AnniesLasso', '/scratch/mk27/mj8805/AnniesLasso']:
+# identical to the AnniesLasso notebook that defines this dataset (candidates
+# resolved relative to this file first, so imports work from any cwd)
+_REPO_PARENT = os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))))
+for cand in [os.path.join(_REPO_PARENT, 'AnniesLasso'), '../../AnniesLasso',
+             '/scratch/mk27/mj8805/AnniesLasso']:
     if os.path.exists(os.path.join(cand, 'thecannon', 'continuum.py')):
         sys.path.append(os.path.abspath(cand))
         break
@@ -78,10 +82,13 @@ def to_array(x):
     return arr[None] if arr.ndim == 0 else arr
 
 
-def load_dataset(src, seed, test_size):
+def load_dataset(src, seed, test_size, return_pixel_mask=False):
     """The training notebook's data pipeline, condensed; see
     notebooks/train-rgb-wilett-all-missions.ipynb for the rationale of every
-    cut. Returns the Lux arrays and the notebook's exact train/test split."""
+    cut. Returns the Lux arrays and the notebook's exact train/test split;
+    with ``return_pixel_mask`` also the boolean reliable-pixel mask over the
+    full grid (needed to apply a saved model to new spectra -- the mask is
+    not persisted in the .dill)."""
     spectra = pd.read_parquet(
         src / 'bulge-ages-and-orbits/data/merged_with_ages_raw.parquet')
     spectra = spectra[np.isfinite(spectra['age_L'])].reset_index(drop=True)
@@ -183,6 +190,9 @@ def load_dataset(src, seed, test_size):
 
     print(f'{fluxes.shape[0]} RGB stars ({len(train_mask)} train / '
           f'{len(test_mask)} test), {int(keep.sum())}/{keep.size} pixels kept')
+    if return_pixel_mask:
+        return (labels, labels_err, fluxes, fluxes_err, train_mask, test_mask,
+                np.asarray(keep))
     return labels, labels_err, fluxes, fluxes_err, train_mask, test_mask
 
 
