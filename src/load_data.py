@@ -13,6 +13,65 @@ import dill as pickle
 # FUNCTIONS TO LOAD IN THE SPECTRA AND LABELS
 ############################################################
 
+# Realistic literature accuracy floors for ASPCAP-style labels (native units;
+# dex for abundances and log_age). ASPCAP formal errors are internal precisions
+# far below the true accuracy, so the 1/err^2 label weights over-trust noisy
+# abundances like c_fe and the fit overfits to label noise. Keys are matched
+# case-insensitively after stripping leading raw_/e_ and a trailing _err, so the
+# function works for both the FITS (C_FE_ERR) and parquet (raw_e_c_fe) naming
+# conventions. Mirrors run_sweep.ERR_FLOOR.
+ERR_FLOOR = {
+    'teff': 30., 'logg': 0.05, 'fe_h': 0.03,
+    'mg_fe': 0.03, 'c_fe': 0.05, 'o_fe': 0.05, 'n_fe': 0.05,
+    'log_age_dnu': 0.05,
+}
+
+
+def _floor_key(name):
+    """Normalise a label/error column name to an ERR_FLOOR lookup key."""
+    key = name.lower()
+    if key.startswith('raw_'):
+        key = key[4:]
+    if key.startswith('e_'):
+        key = key[2:]
+    if key.endswith('_err'):
+        key = key[:-4]
+    return key
+
+
+def apply_error_floor(labels_err, err_col_names, err_floor=ERR_FLOOR,
+                      sentinel=9999.):
+    """Raise unrealistically small label errors to a per-label accuracy floor.
+
+    INPUT:
+            labels_err:    (N_stars, M_labels) array of 1-sigma label errors
+            err_col_names: length-M names aligned with labels_err columns
+                           (e.g. label_data['label_names_err'])
+
+    OUTPUT:
+            (labels_err_floored, labels_ivars) as jax arrays, where
+            labels_ivars = 1 / labels_err_floored**2.
+
+    Missing-label sentinels (>= 9000) are left untouched so absent labels stay
+    effectively unweighted. Columns whose name has no ERR_FLOOR entry keep their
+    original error (old behaviour). The floored/skipped split is printed.
+    """
+    err = np.array(labels_err, dtype=float)
+    floored, skipped = [], []
+    for m, name in enumerate(err_col_names):
+        floor = err_floor.get(_floor_key(name))
+        if floor is None:
+            skipped.append(name)
+            continue
+        col = err[:, m]
+        keep = col >= sentinel - 1.  # preserve missing-label sentinels
+        err[:, m] = np.where(keep, col, np.maximum(col, floor))
+        floored.append(f'{name}->{floor:g}')
+    print('label error floor applied: ' + (', '.join(floored) or 'none'))
+    if skipped:
+        print('  (no floor for: ' + ', '.join(skipped) + ')')
+    return jnp.array(err), jnp.array(1. / err**2)
+
 def load_data(spectra_dir_path, labels_file, file_name):
         """
                 Load all the spectra and label data in one go

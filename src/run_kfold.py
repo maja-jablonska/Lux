@@ -29,6 +29,16 @@ train_label = label_data['labels']
 train_label_err = label_data['labels_err']
 train_label_ivar = label_data['labels_ivars']
 
+# ASPCAP formal errors are far below the true accuracy, so floor each label's
+# error at a realistic value before it becomes the 1/err^2 training weight.
+# Without this the fit over-trusts noisy abundances (e.g. c_fe) and overfits to
+# label noise. Floors both err and ivar so the no-noise and scatter agendas stay
+# consistent. Set ENABLE here to False to recover the old behaviour.
+ENABLE_ERR_FLOOR = True
+if ENABLE_ERR_FLOOR:
+    train_label_err, train_label_ivar = ld.apply_error_floor(
+        train_label_err, label_data['label_names_err'])
+
 # initialise the noise in the pixels
 ln_noise_fluxes_init = jnp.full(train_flux.shape[1], -8.0)
 

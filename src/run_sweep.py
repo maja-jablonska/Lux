@@ -42,6 +42,17 @@ LABEL_NAMES = ['raw_teff', 'raw_logg', 'raw_fe_h', 'mg_fe', 'c_fe', 'o_fe',
 LABEL_ERRS = ['raw_e_teff', 'raw_e_logg', 'raw_e_fe_h', 'e_mg_fe', 'e_c_fe',
               'e_o_fe', 'e_n_fe', 'e_log_age_Dnu']
 
+# ASPCAP formal errors are internal precisions far below the true accuracy, so the
+# inverse-variance label weights (1/err^2) over-trust noisy abundances such as c_fe
+# and the model overfits to label noise. Floor each label's error at a realistic
+# literature accuracy before training. These are the same floors the notebook uses
+# at evaluation time; applying them during the fit too keeps train/eval consistent.
+ERR_FLOOR = {  # native units; dex for abundances and log_age
+    'raw_teff': 30., 'raw_logg': 0.05, 'raw_fe_h': 0.03,
+    'mg_fe': 0.03, 'c_fe': 0.05, 'o_fe': 0.05, 'n_fe': 0.05,
+    'log_age_Dnu': 0.05,
+}
+
 
 def load_and_clean(path):
     """Load the merged APOGEE parquet and apply the notebook's cleaning cuts."""
@@ -86,8 +97,14 @@ def load_and_clean(path):
     return spectra
 
 
-def build_arrays(spectra):
-    """Continuum-normalise the fluxes and assemble the label/flux matrices."""
+def build_arrays(spectra, err_floor=True):
+    """Continuum-normalise the fluxes and assemble the label/flux matrices.
+
+    err_floor: if True, raise each label's error to ``ERR_FLOOR`` before it
+        becomes the 1/err^2 training weight (missing-label 9999 sentinels are
+        preserved). Stops the fit from over-trusting unrealistically precise
+        ASPCAP abundance errors (e.g. c_fe).
+    """
     raw_flux = np.array(spectra['flux'].tolist())
     raw_ivar = np.array(spectra['ivar'].tolist())
     cont = np.array(spectra['continuum'].tolist())
@@ -103,7 +120,12 @@ def build_arrays(spectra):
 
     labels = jnp.array(spectra[LABEL_NAMES].values)
     labels_err_np = np.array(spectra[LABEL_ERRS].values, dtype=float)
-    labels_err = jnp.array(np.where(labels_err_np > 0, labels_err_np, 9999.))
+    missing = ~(labels_err_np > 0)  # True for <=0, NaN, inf (matches old >0 test)
+    if err_floor:
+        floor_vec = np.array([ERR_FLOOR.get(n, 0.) for n in LABEL_NAMES])
+        labels_err_np = np.maximum(labels_err_np, floor_vec)  # broadcasts over columns
+    labels_err_np[missing] = 9999.  # keep missing-label sentinels untouched
+    labels_err = jnp.array(labels_err_np)
 
     return labels, labels_err, fluxes, fluxes_err, float(bad.mean())
 
@@ -144,6 +166,12 @@ def main():
                         help='L2 regularisation strengths to sweep')
     parser.add_argument('--n-iterations', type=int, default=2000,
                         help='coordinate-descent iterations per fit')
+    parser.add_argument('--err-floor', dest='err_floor', action='store_true',
+                        default=True,
+                        help='floor unrealistic ASPCAP label errors before '
+                             'training (default: on)')
+    parser.add_argument('--no-err-floor', dest='err_floor', action='store_false',
+                        help='disable the label error floor (old behaviour)')
     parser.add_argument('--test-size', type=float, default=0.2)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--outdir', default='sweep-models',
@@ -170,7 +198,9 @@ def main():
                 'could not locate merged_with_ages.parquet; pass --data')
 
     spectra = load_and_clean(data_path)
-    labels, labels_err, fluxes, fluxes_err, bad_frac = build_arrays(spectra)
+    labels, labels_err, fluxes, fluxes_err, bad_frac = build_arrays(
+        spectra, err_floor=args.err_floor)
+    print(f'label error floor: {"on" if args.err_floor else "off"}')
     print(f'{fluxes.shape[0]} stars, {fluxes.shape[1]} pixels, '
           f'bad pixel fraction: {bad_frac:.3f}')
 
@@ -191,6 +221,7 @@ def main():
             config={
                 'P': P,
                 'l2_reg_strength': l2,
+                'err_floor': args.err_floor,
                 'n_iterations': args.n_iterations,
                 'test_size': args.test_size,
                 'seed': args.seed,
