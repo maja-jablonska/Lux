@@ -131,8 +131,8 @@ def main():
         model, fluxes, fluxes_err, chunk=args.chunk)
 
     out = pd.DataFrame({"APOGEE_ID": stars["APOGEE_ID"]})
-    for c in ("source", "is_primary", "evo_state_source", "rgb_proba",
-              "EvoState", "snr", "numax"):
+    for c in ("row_id", "source", "is_primary", "is_dup_spectrum",
+              "evo_state_source", "rgb_proba", "EvoState", "snr", "numax"):
         if c in stars.columns:
             out[c] = stars[c].to_numpy()
     for j, name in enumerate(stardata.LUX_LABELS):
