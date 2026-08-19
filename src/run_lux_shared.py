@@ -111,14 +111,12 @@ def main():
     split = stars["split"].to_numpy()
     train_mask = (split == "train") | (args.include_val & (split == "val"))
 
-    # reliable-pixel columns, from the SHARED train split only
-    good_frac = (fluxes_err[train_mask] < 100).mean(axis=0)
-    keep = good_frac > args.good_pixel_frac
+    # the SAME wavelength columns the Cannon uses — shared, persisted once
+    out_dir = Path(args.dataset_dir)
+    keep = stardata.shared_pixel_mask(out_dir, nivar, train_mask,
+                                      args.good_pixel_frac)
     print(f"pixel mask: keeping {keep.sum()}/{keep.size} columns")
     fluxes, fluxes_err = fluxes[:, keep], fluxes_err[:, keep]
-
-    out_dir = Path(args.dataset_dir)
-    np.save(out_dir / "lux_pixel_mask.npy", keep)
 
     np.random.seed(args.seed)
     model = LuxModel(P=args.P)
@@ -133,13 +131,16 @@ def main():
         model, fluxes, fluxes_err, chunk=args.chunk)
 
     out = pd.DataFrame({"APOGEE_ID": stars["APOGEE_ID"]})
-    for c in ("source", "evo_state_source", "rgb_proba", "EvoState",
-              "snr", "numax"):
+    for c in ("row_id", "source", "is_primary", "is_dup_spectrum",
+              "evo_state_source", "rgb_proba", "EvoState", "snr", "numax"):
         if c in stars.columns:
             out[c] = stars[c].to_numpy()
     for j, name in enumerate(stardata.LUX_LABELS):
         out[name] = labels[:, j]
-    for j, name in enumerate(stardata.LUX_ERRS):
+    for name in stardata.LUX_ERRS:
+        if name not in stars.columns:
+            sys.exit(f"dataset is missing '{name}' — it predates the shared "
+                     f"label vector; rebuild it with --rebuild")
         out[name] = stars[name].to_numpy()
     out["split"] = split
     for j, name in enumerate(stardata.LUX_LABELS):
