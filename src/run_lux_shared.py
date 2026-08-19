@@ -87,6 +87,12 @@ def main():
                     help="numpy global seed: LuxModel initializes its "
                          "latents from np.random.rand, which is otherwise "
                          "unseeded and irreproducible")
+    ap.add_argument("--mode", choices=["holdout", "oof"], default="holdout",
+                    help="'oof' additionally refits per fold over the "
+                         "non-test stars, so EVERY star gets an "
+                         "out-of-sample prediction rather than the 20% in "
+                         "the test split. Costs one fit per fold; mirrors "
+                         "run_cannon_shared.py --mode oof.")
     ap.add_argument("--fit-label-scatters", default="off",
                     choices=["on", "off"],
                     help="let Lux LEARN a per-label scatter, added in "
@@ -130,13 +136,16 @@ def main():
     print(f"pixel mask: keeping {keep.sum()}/{keep.size} columns")
     fluxes, fluxes_err = fluxes[:, keep], fluxes_err[:, keep]
 
-    np.random.seed(args.seed)
-    model = LuxModel(P=args.P)
-    model.fit(labels[train_mask], labels_err[train_mask],
-              fluxes[train_mask], fluxes_err[train_mask],
+    def fit_on(mask, verbose=True):
+        np.random.seed(args.seed)
+        m = LuxModel(P=args.P)
+        m.fit(labels[mask], labels_err[mask], fluxes[mask], fluxes_err[mask],
               n_iterations=args.n_iterations, l2_reg_strength=args.l2,
-              label_names=stardata.LUX_LABELS, verbose=True,
+              label_names=stardata.LUX_LABELS, verbose=verbose,
               fit_label_scatters=args.fit_label_scatters == "on")
+        return m
+
+    model = fit_on(train_mask)
 
     if model.ln_noise_labels is not None:
         learned = np.exp(np.asarray(model.ln_noise_labels))
@@ -163,6 +172,23 @@ def main():
 
     pred, pred_err, chi2, n_good = predict_with_diagnostics(
         model, fluxes, fluxes_err, chunk=args.chunk)
+
+    if args.mode == "oof":
+        # Refit per fold so the non-test stars are also predicted from a
+        # model that never saw them. Test-split rows keep the holdout
+        # predictions above; every other star gets its own fold's model.
+        fold = stars["fold"].to_numpy()
+        for k in sorted({int(f) for f in fold if f >= 0}):
+            tm = (split != "test") & (fold != k)
+            pm = fold == k
+            if not pm.any():
+                continue
+            print(f"\nOOF fold {k}: training on {tm.sum()}, "
+                  f"predicting {pm.sum()}")
+            mk = fit_on(tm, verbose=False)
+            pk, ek, ck, nk = predict_with_diagnostics(
+                mk, fluxes[pm], fluxes_err[pm], chunk=args.chunk)
+            pred[pm], pred_err[pm], chi2[pm], n_good[pm] = pk, ek, ck, nk
 
     out = pd.DataFrame({"APOGEE_ID": stars["APOGEE_ID"]})
     for c in ("row_id", "source", "is_primary", "is_dup_spectrum",
