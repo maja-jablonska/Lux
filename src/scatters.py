@@ -291,8 +291,17 @@ def all_stars_all_wavelengths_all_labels_Gaussian_likelihood(params, data, reg_s
         """
 
         model_labels = synthesise_all_labels_all_stars(params['zetas'], data['alphas'])
-        noise_labels = 1./ data['labels_ivars'] 
-        loglike_labels = -0.5 * jnp.nansum((data['labels'] - model_labels)**2 / (noise_labels))
+        # Learned per-label scatter, exactly as for the pixels below. The
+        # catalogue label errors are formal precisions and badly
+        # underestimated (the median APOGEE [Fe/H] error is 0.001 dex), so
+        # without this the labels are over-trusted by orders of magnitude in
+        # weight. NOTE the -0.5*sum(log noise) term is REQUIRED once the
+        # noise is free: without it the likelihood rises monotonically with
+        # the scatter and the labels would simply be discarded.
+        Vl = jnp.exp(2 * _ln_noise_labels(params, data['labels'].shape[1]))
+        noise_labels = 1./ data['labels_ivars'] + Vl[None, :]
+        loglike_labels = -0.5 * jnp.nansum((data['labels'] - model_labels)**2 / (noise_labels)) \
+                         -0.5 * jnp.nansum(jnp.log(noise_labels))
         
         model_fluxes = synthesise_all_wavelengths_all_stars(params['zetas'], data['betas'])
         V =  jnp.exp(2 * params['ln_noise_fluxes'])
@@ -355,6 +364,16 @@ def zeta_step(alphas, betas, zetas, labels, labels_ivars, fluxes, fluxes_ivars, 
 # instead of drifting to arbitrary very negative values as under LBFGS
 _LN_NOISE_FLOOR = -20.0
 
+def _ln_noise_labels(params, n_labels):
+        """Per-label log-scatter from params, defaulting to the floor.
+
+        Optional so the legacy LBFGS zeta_step path keeps working unchanged.
+        """
+        v = params.get('ln_noise_labels')
+        if v is None:
+                return jnp.full(n_labels, _LN_NOISE_FLOOR)
+        return v
+
 def _masked(values, weights):
         """Zero out the weight (and value) of non-finite data entries."""
         mask = jnp.isfinite(values)
@@ -381,7 +400,7 @@ def beta_step_direct(zetas, fluxes, fluxes_ivars, ln_noise_fluxes):
         return jnp.linalg.solve(ZtWZ + 1e-12 * jnp.eye(zetas.shape[1]),
                                 ZtWf[..., None])[..., 0]
 
-def zeta_step_direct(alphas, betas, labels, labels_ivars, fluxes, fluxes_ivars, ln_noise_fluxes, reg_std, omega):
+def zeta_step_direct(alphas, betas, labels, labels_ivars, fluxes, fluxes_ivars, ln_noise_fluxes, reg_std, omega, ln_noise_labels=None):
         """
                 Exact zetas at fixed alphas, betas, and scatters: for each star n the
                 objective is quadratic, so solve the ridge-regularised normal equations
@@ -396,13 +415,17 @@ def zeta_step_direct(alphas, betas, labels, labels_ivars, fluxes, fluxes_ivars, 
                         ln_noise_fluxes: logarithmic scatters in the pixels, Lambda
                         reg_std: L2 regularisation strength
                         omega: weight of the label term in the likelihood
+                        ln_noise_labels: logarithmic scatters in the labels, M
+                                (None -> no extra label scatter)
                 OUTPUT:
                         optimised zetas, N x P
         """
         P = alphas.shape[1]
         V = jnp.exp(2 * ln_noise_fluxes)
+        Vl = jnp.exp(2 * (jnp.full(alphas.shape[0], _LN_NOISE_FLOOR)
+                          if ln_noise_labels is None else ln_noise_labels))
         f, wf = _masked(fluxes, 1. / (1. / fluxes_ivars + V[None, :]))
-        l, wl = _masked(labels, labels_ivars)
+        l, wl = _masked(labels, 1. / (1. / labels_ivars + Vl[None, :]))
         aa = alphas[:, :, None] * alphas[:, None, :]            # M x P x P
         bb = betas[:, :, None] * betas[:, None, :]              # Lambda x P x P
         G = omega * jnp.einsum('mpq,nm->npq', aa, wl) \
@@ -420,24 +443,23 @@ def _pixel_noise_score(V, resid2, var_data, weights):
         t = var_data + V[None, :]
         return jnp.sum(weights * (resid2 - t) / t**2, axis=0)
 
-def fluxnoise_step_direct(betas, fluxes, fluxes_ivars, zetas):
+def _scatter_step_direct(resid2, var_data, weights):
         """
-                Exact per-pixel scatters at fixed betas and zetas, via bisection on the
-                stationarity condition in the extra-variance V = exp(2 ln_noise). V = 0
-                (no extra scatter) is detected from the score at V = 0 and mapped to
-                _LN_NOISE_FLOOR
+                Exact per-column scatters via bisection on the stationarity condition
+                in the extra-variance V = exp(2 ln_noise). V = 0 (no extra scatter) is
+                detected from the score at V = 0 and mapped to _LN_NOISE_FLOOR.
+
+                Shared by the per-pixel (fluxes) and per-label solvers: the algebra is
+                identical, only the axis being reduced over differs.
                 INPUT:
-                        betas: latent parameters for wavelengths, Lambda x P
-                        fluxes: fluxes for all stars, N x Lambda
-                        fluxes_ivars: flux inverse variances for all stars, N x Lambda
-                        zetas: latent parameters, N x P
+                        resid2: squared residuals, N x K
+                        var_data: reported variances, N x K
+                        weights: per-entry weights (0 for masked entries), N x K
                 OUTPUT:
-                        optimised logarithmic scatters, Lambda
+                        optimised logarithmic scatters, K
         """
-        resid2, weights = _masked((fluxes - zetas @ betas.T)**2, jnp.ones_like(fluxes))
-        var_data = 1. / fluxes_ivars
         # the optimum satisfies V <= max_n r_n^2, so [0, max r^2] brackets the root
-        lo = jnp.zeros(fluxes.shape[1])
+        lo = jnp.zeros(resid2.shape[1])
         hi = jnp.max(weights * resid2, axis=0)
         score0 = _pixel_noise_score(lo, resid2, var_data, weights)
 
@@ -454,10 +476,45 @@ def fluxnoise_step_direct(betas, fluxes, fluxes_ivars, zetas):
                              _LN_NOISE_FLOOR)
         return jnp.maximum(ln_noise, _LN_NOISE_FLOOR)
 
+def fluxnoise_step_direct(betas, fluxes, fluxes_ivars, zetas):
+        """
+                Exact per-pixel scatters at fixed betas and zetas.
+                INPUT:
+                        betas: latent parameters for wavelengths, Lambda x P
+                        fluxes: fluxes for all stars, N x Lambda
+                        fluxes_ivars: flux inverse variances for all stars, N x Lambda
+                        zetas: latent parameters, N x P
+                OUTPUT:
+                        optimised logarithmic scatters, Lambda
+        """
+        resid2, weights = _masked((fluxes - zetas @ betas.T)**2, jnp.ones_like(fluxes))
+        return _scatter_step_direct(resid2, 1. / fluxes_ivars, weights)
+
+def labelnoise_step_direct(alphas, labels, labels_ivars, zetas):
+        """
+                Exact per-LABEL scatters at fixed alphas and zetas -- the label
+                analogue of fluxnoise_step_direct.
+
+                This is what lets Lux learn the label uncertainty the catalogue
+                understates, instead of being handed an asserted one. The fitted
+                value absorbs everything the latent space cannot explain about a
+                label, so read it as an upper bound on that label's measurement
+                error: it also carries model inadequacy.
+                INPUT:
+                        alphas: latent parameters for labels, M x P
+                        labels: labels for all stars, N x M
+                        labels_ivars: label inverse variances for all stars, N x M
+                        zetas: latent parameters, N x P
+                OUTPUT:
+                        optimised logarithmic scatters, M
+        """
+        resid2, weights = _masked((labels - zetas @ alphas.T)**2, jnp.ones_like(labels))
+        return _scatter_step_direct(resid2, 1. / labels_ivars, weights)
+
 
 ###################### RUN FULL AGENDA
 
-def run_agenda(alphas, betas, zetas, labels, labels_ivars, fluxes, fluxes_ivars, ln_noise_fluxes, reg_std, omega):
+def run_agenda(alphas, betas, zetas, labels, labels_ivars, fluxes, fluxes_ivars, ln_noise_fluxes, reg_std, omega, fit_label_noise=True):
 
         """
         One exact coordinate-descent sweep over the scatters, betas, and zetas
@@ -486,6 +543,15 @@ def run_agenda(alphas, betas, zetas, labels, labels_ivars, fluxes, fluxes_ivars,
         # exact per-pixel scatters at the current betas and zetas
         ln_noise_fluxes_updated = fluxnoise_step_direct(betas, fluxes, fluxes_ivars, zetas)
 
+        # exact per-label scatters at the current alphas and zetas. Selected
+        # with a traced where rather than a Python branch so the agenda stays
+        # jittable without a static argument; M is tiny, so evaluating both
+        # sides costs nothing.
+        ln_noise_labels_updated = jnp.where(
+                fit_label_noise,
+                labelnoise_step_direct(alphas, labels, labels_ivars, zetas),
+                jnp.full(alphas.shape[0], _LN_NOISE_FLOOR))
+
         # closed-form betas at the updated scatters
         betas_updated = beta_step_direct(zetas, fluxes, fluxes_ivars, ln_noise_fluxes_updated)
 
@@ -493,15 +559,17 @@ def run_agenda(alphas, betas, zetas, labels, labels_ivars, fluxes, fluxes_ivars,
         # sees the latest values of the others, unlike the previous LBFGS agenda
         # which optimised the zetas against the stale betas and scatters)
         zetas_updated = zeta_step_direct(alphas, betas_updated, labels, labels_ivars,
-                                         fluxes, fluxes_ivars, ln_noise_fluxes_updated, reg_std, omega)
+                                         fluxes, fluxes_ivars, ln_noise_fluxes_updated,
+                                         reg_std, omega, ln_noise_labels_updated)
 
-        params = {'zetas': zetas_updated, 'ln_noise_fluxes': ln_noise_fluxes_updated}
+        params = {'zetas': zetas_updated, 'ln_noise_fluxes': ln_noise_fluxes_updated,
+                  'ln_noise_labels': ln_noise_labels_updated}
         data = {'alphas': alphas, 'betas': betas_updated,
                 'labels': labels, 'labels_ivars': labels_ivars,
                 'fluxes': fluxes, 'fluxes_ivars': fluxes_ivars}
         nll = all_stars_all_wavelengths_all_labels_objective(params, data, reg_std, omega)
 
-        return betas_updated, zetas_updated, ln_noise_fluxes_updated, nll
+        return betas_updated, zetas_updated, ln_noise_fluxes_updated, ln_noise_labels_updated, nll
 
 # jit the full agenda so repeated sweeps reuse the compiled program
 run_agenda = jax.jit(run_agenda)

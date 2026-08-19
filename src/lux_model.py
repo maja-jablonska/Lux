@@ -76,6 +76,7 @@ class LuxModel:
         self.betas = None             # Lambda x P
         self.zetas = None             # N_train x P
         self.ln_noise_fluxes = None   # Lambda (only when scatters are fitted)
+        self.ln_noise_labels = None   # M      (only when scatters are fitted)
 
         # training metadata
         self.label_names = None
@@ -104,7 +105,8 @@ class LuxModel:
 
     def fit(self, labels, labels_err, fluxes, fluxes_err, n_iterations=5,
             fit_scatters=True, l2_reg_strength=1.0, ln_noise_fluxes_init=-8.0,
-            max_scatter_sweeps=100, label_names=None, verbose=True):
+            max_scatter_sweeps=100, label_names=None, verbose=True,
+            fit_label_scatters=True):
         """
         Train the model latents on a set of stars with known labels and spectra.
 
@@ -117,6 +119,13 @@ class LuxModel:
                               alpha/beta/zeta coordinate-descent agenda
                 fit_scatters: if True, follow up with the regularised agenda
                               that also fits per-pixel noise (scatters)
+                fit_label_scatters: if True, also fit a per-LABEL scatter,
+                              added in quadrature to the reported label
+                              errors. Catalogue label errors are formal
+                              precisions and heavily understated, so without
+                              this the labels are over-trusted; with it the
+                              model infers how much to trust each one. Only
+                              used when fit_scatters is True.
                 l2_reg_strength: L2 regularisation strength on the zetas
                                  (only used when fit_scatters is True)
                 ln_noise_fluxes_init: initial value of the logarithmic
@@ -168,6 +177,7 @@ class LuxModel:
 
         self.nll = None
         self.ln_noise_fluxes = None
+        self.ln_noise_labels = None
         if fit_scatters:
             labels_ivars = 1. / labels_err**2
             fluxes_ivars = 1. / fluxes_err**2
@@ -179,19 +189,28 @@ class LuxModel:
             # stop once the relative improvement is negligible
             nll = np.inf
             for sweep in range(max_scatter_sweeps):
-                betas, zetas, ln_noise_fluxes, nll_sweep = opt_sc.run_agenda(
+                betas, zetas, ln_noise_fluxes, ln_noise_labels, nll_sweep = opt_sc.run_agenda(
                     alphas, betas, zetas, labels, labels_ivars, fluxes, fluxes_ivars,
-                    ln_noise_fluxes, float(l2_reg_strength), self.omega)
+                    ln_noise_fluxes, float(l2_reg_strength), self.omega,
+                    bool(fit_label_scatters))
                 nll_sweep = float(nll_sweep)
                 converged = nll - nll_sweep <= 1e-6 * max(1.0, abs(nll_sweep))
                 nll = nll_sweep
                 if converged:
                     break
             self.ln_noise_fluxes = ln_noise_fluxes
+            self.ln_noise_labels = ln_noise_labels if fit_label_scatters else None
             self.nll = nll
             if verbose:
                 print(f"scatter fit: {sweep + 1} sweeps, "
                       f"negative log-likelihood = {self.nll:.4f}")
+                if self.ln_noise_labels is not None:
+                    sc = np.exp(np.asarray(self.ln_noise_labels))
+                    names = self.label_names or [f"label {i}" for i in range(len(sc))]
+                    print("learned label scatters (added in quadrature to the "
+                          "reported errors):")
+                    for nm, v in zip(names, sc):
+                        print(f"    {nm:>16s}  {v:.5g}")
 
         self.alphas = alphas
         self.betas = betas
@@ -327,6 +346,8 @@ class LuxModel:
             'zetas': None if self.zetas is None else np.asarray(self.zetas),
             'ln_noise_fluxes': None if self.ln_noise_fluxes is None
                                else np.asarray(self.ln_noise_fluxes),
+            'ln_noise_labels': None if self.ln_noise_labels is None
+                               else np.asarray(self.ln_noise_labels),
             'label_names': self.label_names,
             'chi2_history': self.chi2_history,
             'nll': self.nll,
@@ -341,8 +362,10 @@ class LuxModel:
         with open(path, 'rb') as f:
             state = pickle.load(f)
         model = cls(P=state['P'], omega=state['omega'])
-        for key in ('alphas', 'betas', 'zetas', 'ln_noise_fluxes'):
-            value = state[key]
+        for key in ('alphas', 'betas', 'zetas', 'ln_noise_fluxes',
+                    'ln_noise_labels'):
+            value = state.get(key)      # .get: models saved before label
+                                        # scatters existed have no such key
             setattr(model, key, None if value is None else jnp.asarray(value))
         model.label_names = state['label_names']
         model.chi2_history = state['chi2_history']

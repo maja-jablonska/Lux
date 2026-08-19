@@ -87,6 +87,18 @@ def main():
                     help="numpy global seed: LuxModel initializes its "
                          "latents from np.random.rand, which is otherwise "
                          "unseeded and irreproducible")
+    ap.add_argument("--fit-label-scatters", default="off",
+                    choices=["on", "off"],
+                    help="let Lux LEARN a per-label scatter, added in "
+                         "quadrature to the reported label errors, instead of "
+                         "trusting them. The catalogue errors are formal "
+                         "precisions (median [Fe/H] error 0.001 dex), so "
+                         "without this the labels are over-trusted by orders "
+                         "of magnitude in weight. Caveat: latent directions "
+                         "the FLUXES do not constrain can absorb label noise "
+                         "instead, in which case the fitted scatters collapse "
+                         "to ~0 -- check the reported values before trusting "
+                         "a run at large P.")
     ap.add_argument("--good-pixel-frac", type=float, default=0.99,
                     help="train-split reliable-pixel column threshold")
     ap.add_argument("--out", default=None,
@@ -123,7 +135,29 @@ def main():
     model.fit(labels[train_mask], labels_err[train_mask],
               fluxes[train_mask], fluxes_err[train_mask],
               n_iterations=args.n_iterations, l2_reg_strength=args.l2,
-              label_names=stardata.LUX_LABELS, verbose=True)
+              label_names=stardata.LUX_LABELS, verbose=True,
+              fit_label_scatters=args.fit_label_scatters == "on")
+
+    if model.ln_noise_labels is not None:
+        learned = np.exp(np.asarray(model.ln_noise_labels))
+        rep = pd.DataFrame({
+            "label": stardata.LUX_LABELS,
+            "learned_scatter": learned,
+            "reported_rms": [float(np.sqrt(np.mean(
+                labels_err[train_mask][:, j][labels_err[train_mask][:, j]
+                                            < stardata.LUX_MISSING] ** 2)))
+                             for j in range(len(stardata.LUX_LABELS))],
+            "label_syst_asserted": [stardata.LABEL_SYST.get(l, np.nan)
+                                    for l in stardata.LUX_LABELS]})
+        rep["learned_over_asserted"] = (rep.learned_scatter
+                                        / rep.label_syst_asserted)
+        print("\nlearned label scatters vs what stardata asserts:")
+        print(rep.round(5).to_string(index=False))
+        if (learned < 1e-4).all():
+            print("WARNING: every learned scatter collapsed to ~0. The latent "
+                  "space is absorbing the label noise -- P is too large for "
+                  "these to be identifiable. Treat them as uninformative.")
+        rep.to_csv(out_dir / "lux_label_scatters.csv", index=False)
     if args.model_out:
         model.save(args.model_out)
 
