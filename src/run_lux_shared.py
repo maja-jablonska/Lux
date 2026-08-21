@@ -87,6 +87,15 @@ def main():
                     help="numpy global seed: LuxModel initializes its "
                          "latents from np.random.rand, which is otherwise "
                          "unseeded and irreproducible")
+    ap.add_argument("--apply-to", default=None,
+                    help="parquet of spectra OUTSIDE the labelled sample to "
+                         "apply the trained model to (e.g. the bulge RGB "
+                         "sample). Trained exactly as for the benchmark, so "
+                         "the measured performance is the relevant one -- but "
+                         "note stars outside the training parameter range are "
+                         "extrapolation and are flagged as such.")
+    ap.add_argument("--apply-out", default=None,
+                    help="where to write the applied predictions")
     ap.add_argument("--mode", choices=["holdout", "oof"], default="holdout",
                     help="'oof' additionally refits per fold over the "
                          "non-test stars, so EVERY star gets an "
@@ -214,6 +223,34 @@ def main():
         out_dir / "lux_shared_results.parquet"
     out.to_parquet(out_path)
     print(f"wrote {len(out)} rows to {out_path}")
+
+    if args.apply_to:
+        print(f"\napplying the trained model to {args.apply_to}")
+        ids, xf, xi = stardata.load_external_spectra(
+            args.apply_to, dispersion, continuum_list=args.continuum_list,
+            data_root=args.data_root)
+        xfl, xfe = stardata.lux_flux_arrays(xf, xi)
+        xfl, xfe = xfl[:, keep], xfe[:, keep]
+        print(f"  {len(ids)} stars, {xfl.shape[1]} pixels")
+        ap_pred, ap_err, ap_chi2, ap_ng = predict_with_diagnostics(
+            model, xfl, xfe, chunk=args.chunk)
+        ao = pd.DataFrame({"star_id": ids})
+        for j, name in enumerate(stardata.LUX_LABELS):
+            ao[f"pred_{name}"] = ap_pred[:, j]
+            ao[f"pred_err_{name}"] = ap_err[:, j]
+        ao["spec_chi2"] = ap_chi2
+        ao["spec_n_pix"] = ap_ng
+        ao["spec_rchi2"] = ap_chi2 / np.maximum(ap_ng - args.P, 1)
+        ao["in_training_range"] = stardata.coverage_flag(
+            ao.rename(columns={f"pred_{l}": l for l in stardata.LUX_LABELS}),
+            stars[stars["split"] == "train"],
+            labels=["raw_teff", "raw_fe_h"])
+        apath = Path(args.apply_out or (out_dir / "lux_applied.parquet"))
+        ao.to_parquet(apath)
+        n_out = int((~ao.in_training_range).sum())
+        print(f"  wrote {len(ao)} predictions to {apath}")
+        print(f"  {n_out} ({100*n_out/len(ao):.1f}%) fall outside the training "
+              f"parameter range and are flagged in_training_range=False")
 
 
 if __name__ == "__main__":
